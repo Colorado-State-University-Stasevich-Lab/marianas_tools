@@ -32,6 +32,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import tifffile as tiff
 
+__all__ = ["assemble_marianas_stack"]
 
 TIFF_RE = re.compile(
     r"^(?P<base>.+)_Z(?P<z>\d+)_T(?P<t>\d+)_C(?P<c>\d+)\.(?P<ext>tif|tiff)$",
@@ -429,6 +430,177 @@ def write_ome_tiff(path: Path, data_tzyxc: np.ndarray) -> None:
         metadata={"axes": "TZYXC"},
         bigtiff=bigtiff,
     )
+
+
+def assemble_marianas_stack(
+    input_dir: Path | str,
+    *,
+    out_dir: Path | str | None = None,
+    recursive: bool = False,
+    save: bool = True,
+    allow_missing_files: bool = False,
+    fill_value: int | None = None,
+    # Override FINAL assembled dims
+    nt: int | None = None,
+    nz: int | None = None,
+    nc: int | None = None,
+    # Override INTERNAL per-file dims interpretation
+    file_nt: int | None = None,
+    file_nz: int | None = None,
+    file_nc: int | None = None,
+    out_ext: str = "ome.tif",
+    # Optional selection
+    bases: list[str] | None = None,
+    return_data: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """
+    Function for assembling microscope TIFF exports into OME-TIFF stacks.
+
+    Parameters
+    ----------
+    input_dir:
+        Folder containing TIFFs named like <BASE>_Z00_T01_C0.tif
+    out_dir:
+        Output folder (default: input_dir / "Stacks")
+    recursive:
+        If True, search input_dir recursively.
+    save:
+        If True, write OME-TIFF(s). If False, dry-run planning only.
+    allow_missing_files:
+        If True, fill missing file-slots instead of raising.
+    fill_value:
+        Fill value for missing slots (default 0 if allow_missing_files=True).
+    nt/nz/nc:
+        Override FINAL assembled output dims.
+    file_nt/file_nz/file_nc:
+        Override INTERNAL per-file interpretation (disambiguates multi-page TIFF axes).
+    out_ext:
+        Output extension, e.g. "ome.tif".
+    bases:
+        If provided, only assemble groups whose base name is in this list.
+    return_data:
+        If True and save=True, also return the assembled numpy array(s) in-memory.
+        (Beware: can be huge.)
+    verbose:
+        Print plan summaries like the CLI.
+
+    Returns
+    -------
+    dict with keys:
+        - "input_dir", "out_dir", "n_groups"
+        - "plans": list[Plan]
+        - "written": list[Path] (if save=True)
+        - "data": dict[str, np.ndarray] (if return_data=True and save=True)
+        - "notes": list[str]
+    """
+    inp = Path(input_dir)
+    if not inp.exists():
+        raise FileNotFoundError(f"Not found: {inp}")
+
+    outp = Path(out_dir) if out_dir is not None else (inp / "Stacks")
+
+    groups = collect_groups(inp, recursive=recursive)
+    if bases is not None:
+        bases_set = set(bases)
+        groups = {b: g for b, g in groups.items() if b in bases_set}
+
+    if not groups:
+        if verbose:
+            print(f"No matching TIFFs found in {inp}")
+        return {
+            "input_dir": inp,
+            "out_dir": outp,
+            "n_groups": 0,
+            "plans": [],
+            "written": [],
+            "data": {} if return_data else None,
+            "notes": [],
+        }
+
+    written: list[Path] = []
+    data_out: dict[str, np.ndarray] = {}
+    plans: list[Plan] = []
+    notes: list[str] = []
+
+    if verbose:
+        mode = "SAVE" if save else "DRY-RUN"
+        print(f"Found {len(groups)} group(s). Mode: {mode}")
+        print(f"Output dir: {outp}")
+        if any(v is not None for v in (nt, nz, nc)):
+            print(f"Final overrides: nt={nt} nz={nz} nc={nc}")
+        if any(v is not None for v in (file_nt, file_nz, file_nc)):
+            print(f"Internal overrides: file_nt={file_nt} file_nz={file_nz} file_nc={file_nc}")
+        print("")
+
+    for i, (base, g) in enumerate(sorted(groups.items(), key=lambda kv: kv[0].lower()), start=1):
+        plan, internal = plan_group(
+            g=g,
+            out_dir=outp,
+            nz_override=nz,
+            nt_override=nt,
+            nc_override=nc,
+            file_nz=file_nz,
+            file_nt=file_nt,
+            file_nc=file_nc,
+            out_ext=out_ext,
+        )
+        plans.append(plan)
+        notes.append(plan.note)
+
+        if verbose:
+            print(f"[{i}/{len(groups)}] {plan.base}")
+            print(
+                f"  Files: {plan.n_files}  (T vals={g.t_vals[:5]}{'...' if len(g.t_vals)>5 else ''}, "
+                f"Z vals={g.z_vals[:5]}{'...' if len(g.z_vals)>5 else ''}, "
+                f"C vals={g.c_vals})"
+            )
+            print(f"  {plan.note}")
+            print(
+                f"  Output dims: (T,Z,Y,X,C)=({plan.nt},{plan.nz},{plan.yx[0]},{plan.yx[1]},{plan.nc}) "
+                f"dtype={plan.dtype}"
+            )
+            print(f"  Output: {plan.out_path}")
+
+            if plan.missing_keys:
+                print(f"  Missing file-slots: {len(plan.missing_keys)}")
+                for k in plan.missing_keys[:10]:
+                    print(f"    missing {k}")
+                if len(plan.missing_keys) > 10:
+                    print(f"    ... (+{len(plan.missing_keys)-10} more)")
+                if not allow_missing_files:
+                    print("  NOTE: will ERROR on missing unless allow_missing_files=True")
+
+        if save:
+            arr = assemble_group(
+                g=g,
+                plan=plan,
+                internal=internal,
+                allow_missing_files=allow_missing_files,
+                fill_value=fill_value,
+            )
+            write_ome_tiff(plan.out_path, arr)
+            written.append(plan.out_path)
+            if return_data:
+                data_out[plan.base] = arr
+            if verbose:
+                print("  Wrote OME-TIFF.")
+        else:
+            if verbose:
+                print("  Dry-run only (set save=True to write).")
+
+        if verbose:
+            print("")
+
+    return {
+        "input_dir": inp,
+        "out_dir": outp,
+        "n_groups": len(groups),
+        "plans": plans,
+        "written": written,
+        "data": data_out if return_data else None,
+        "notes": notes,
+    }
 
 
 def main() -> int:

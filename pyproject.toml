@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "marianas-tools"
+version = "0.1.0"
+description = "Utilities for handling Marianas microscope data and assembling Z/T/C stacks."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Timothy J. Stasevich" }
+]
+dependencies = [
+  "numpy>=1.23",
+  "tifffile>=2023.0.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/Colorado-State-University-Stasevich-Lab/marianas_tools"
+Repository = "https://github.com/Colorado-State-University-Stasevich-Lab/marianas_tools"
+
+[project.scripts]
+marianas-assemble = "marianas_tools.assemble_stacks_auto:main"
+
+[tool.hatch.build.targets.wheel]
