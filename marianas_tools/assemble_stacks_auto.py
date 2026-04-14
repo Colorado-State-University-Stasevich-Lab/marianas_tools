@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -72,19 +73,35 @@ class InternalShape:
 
 @dataclass
 class Plan:
+    # Core identity
     base: str
+    anchor_path: Path
+
+    # What the assembler inferred about whether axes are spread across filenames
+    # (kept for backward-compatibility with earlier planning output)
     across_t: bool
     across_z: bool
     across_c: bool
+
+    # Final output dimensions (always reported as T,Z,Y,X,C)
     nt: int
     nz: int
     nc: int
     yx: Tuple[int, int]
     dtype: np.dtype
+
+    # Planning / diagnostics
     n_files: int
-    missing_keys: List[FrameKey]
+    missing_keys: List[FrameKey]          # legacy: missing (T,Z,C) slots in filename grid
+    missing_files: List[str]              # missing files referenced by OME-XML (filenames)
+    axes: str | None                      # axes string as reported by tifffile (e.g., "TCZYX", "TZYX")
+    referenced_files: List[str]           # files referenced by OME-XML (filenames)
+    physical_sizes_um: dict[str, float] | None   # {"X": um, "Y": um, "Z": um}
+    time_increment_s: float | None
+
     out_path: Path
     note: str
+
 
 
 def parse_one(path: Path) -> Optional[Tuple[str, FrameKey]]:
@@ -278,6 +295,7 @@ def plan_group(
     return (
         Plan(
             base=g.base,
+            anchor_path=rep_path,
             across_t=across_t,
             across_z=across_z,
             across_c=across_c,
@@ -288,6 +306,11 @@ def plan_group(
             dtype=internal.dtype,
             n_files=len(g.frames),
             missing_keys=missing,
+            missing_files=[],
+            axes=None,
+            referenced_files=[],
+            physical_sizes_um=None,
+            time_increment_s=None,
             out_path=out_path,
             note=note,
         ),
@@ -420,16 +443,404 @@ def assemble_group(
     return out
 
 
-def write_ome_tiff(path: Path, data_tzyxc: np.ndarray) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    bigtiff = data_tzyxc.nbytes >= (4 * 1024**3)
-    tiff.imwrite(
-        str(path),
-        data_tzyxc,
-        ome=True,
-        metadata={"axes": "TZYXC"},
-        bigtiff=bigtiff,
+def write_ome_tiff(path, data_tzyxc, physical_sizes_um=None, time_increment_s=None):
+    import numpy as np
+    import tifffile as tiff
+    path.parent.mkdir(parents=True, exist_ok=True)  # <-- add this line
+    # Convert T Z Y X C  ->  T Z C Y X
+    if data_tzyxc.ndim != 5:
+        raise ValueError(f"Expected 5D TZYXC array, got shape={data_tzyxc.shape}")
+    data_tzcyx = np.moveaxis(data_tzyxc, -1, 2)
+
+    md = {"axes": "TZCYX"}
+
+    def _coerce_physical_sizes_um(v):
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            for keyset in (("X", "Y", "Z"), ("x", "y", "z"), ("sx", "sy", "sz")):
+                if all(k in v for k in keyset):
+                    try:
+                        return tuple(float(v[k]) for k in keyset)
+                    except Exception:
+                        return None
+            return None
+        if isinstance(v, (list, tuple)) and len(v) == 3:
+            try:
+                return (float(v[0]), float(v[1]), float(v[2]))
+            except Exception:
+                return None
+        return None
+
+    sizes = _coerce_physical_sizes_um(physical_sizes_um)
+    if sizes is not None:
+        sx, sy, sz = sizes
+        md["PhysicalSizeX"] = sx
+        md["PhysicalSizeXUnit"] = "µm"
+        md["PhysicalSizeY"] = sy
+        md["PhysicalSizeYUnit"] = "µm"
+        md["PhysicalSizeZ"] = sz
+        md["PhysicalSizeZUnit"] = "µm"
+
+    if time_increment_s is not None:
+        md["TimeIncrement"] = float(time_increment_s)
+        md["TimeIncrementUnit"] = "s"
+
+    tiff.imwrite(str(path), data_tzcyx, ome=True, metadata=md)
+
+
+def _parse_ome_xml(ome_xml: str) -> dict:
+    """Parse a minimal subset of OME-XML needed for planning.
+
+    Returns dict with:
+      - sizes: dict with keys SizeT/SizeZ/SizeC/SizeY/SizeX (ints if present)
+      - physical: dict with keys PhysicalSizeX/Y/Z (floats if present) and units (strings)
+      - time_increment: float seconds if present, else None
+      - referenced_files: list[str] (filenames referenced by OME, may be empty)
+    """
+    try:
+        root = ET.fromstring(ome_xml)
+    except Exception:
+        return {"sizes": {}, "physical": {}, "time_increment_s": None, "referenced_files": []}
+
+    # Namespace handling
+    ns_uri = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
+    ns = {"ome": ns_uri} if ns_uri else {}
+
+    pixels = root.find(".//ome:Pixels", ns) if ns else root.find(".//Pixels")
+    sizes: dict[str, int] = {}
+    physical: dict[str, object] = {}
+    time_increment_s: float | None = None
+
+    if pixels is not None:
+        for k in ("SizeT", "SizeZ", "SizeC", "SizeY", "SizeX"):
+            v = pixels.attrib.get(k)
+            if v is not None:
+                try:
+                    sizes[k] = int(v)
+                except Exception:
+                    pass
+
+        # Physical sizes + units
+        for ax in ("X", "Y", "Z"):
+            v = pixels.attrib.get(f"PhysicalSize{ax}")
+            u = pixels.attrib.get(f"PhysicalSize{ax}Unit")
+            if v is not None:
+                try:
+                    physical[f"PhysicalSize{ax}"] = float(v)
+                except Exception:
+                    pass
+            if u is not None:
+                physical[f"PhysicalSize{ax}Unit"] = u
+
+        ti = pixels.attrib.get("TimeIncrement")
+        tiu = pixels.attrib.get("TimeIncrementUnit", "s")
+        if ti is not None:
+            try:
+                ti_val = float(ti)
+                # Convert to seconds if needed
+                if tiu.lower() in ("s", "sec", "second", "seconds"):
+                    time_increment_s = ti_val
+                elif tiu.lower() in ("ms", "millisecond", "milliseconds"):
+                    time_increment_s = ti_val / 1000.0
+                elif tiu.lower() in ("min", "minute", "minutes"):
+                    time_increment_s = ti_val * 60.0
+                else:
+                    # Unknown units -> assume seconds
+                    time_increment_s = ti_val
+            except Exception:
+                pass
+
+    # Referenced files (multi-file OME)
+    referenced_files: list[str] = []
+    # Common pattern: <TiffData><UUID FileName="..."/>
+    if ns:
+        for uuid in root.findall(".//ome:TiffData/ome:UUID", ns):
+            fn = uuid.attrib.get("FileName")
+            if fn:
+                referenced_files.append(fn)
+    else:
+        for uuid in root.findall(".//TiffData/UUID"):
+            fn = uuid.attrib.get("FileName")
+            if fn:
+                referenced_files.append(fn)
+
+    # Deduplicate while preserving order
+    seen = set()
+    referenced_files = [f for f in referenced_files if not (f in seen or seen.add(f))]
+
+    return {
+        "sizes": sizes,
+        "physical": physical,
+        "time_increment_s": time_increment_s,
+        "referenced_files": referenced_files,
+    }
+
+
+def _physical_um_from_ome(physical: dict) -> dict[str, float] | None:
+    """Return physical sizes in µm if available; heuristically fix bad 'm' units."""
+    if not physical:
+        return None
+
+    out: dict[str, float] = {}
+    for ax in ("X", "Y", "Z"):
+        v = physical.get(f"PhysicalSize{ax}")
+        u = physical.get(f"PhysicalSize{ax}Unit")
+        if v is None:
+            continue
+        try:
+            v = float(v)
+        except Exception:
+            continue
+        u_norm = (u or "").strip()
+
+        # Heuristic: some exports incorrectly mark unit as meters ("m") while values are in microns.
+        # If unit is 'm' and value is "small-ish" (e.g., < 10), treat it as microns.
+        if u_norm in ("m", "meter", "metre"):
+            if v < 10:
+                out[ax] = v  # interpret as µm
+            else:
+                out[ax] = v * 1e6  # meters -> µm
+        elif u_norm in ("µm", "um", "micrometer", "micrometre", "micron", "microns"):
+            out[ax] = v
+        elif u_norm in ("nm", "nanometer", "nanometre"):
+            out[ax] = v / 1000.0
+        else:
+            # Unknown unit: assume µm if value is plausible
+            out[ax] = v
+    return out or None
+
+
+def _parse_log_metadata_ms(log_path: Path) -> dict:
+    """Parse key-value header lines from a Marianas .log file."""
+    info: dict[str, object] = {}
+    try:
+        txt = log_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return info
+
+    # Simple header parsing (stop before the big table header)
+    for line in txt.splitlines():
+        if line.startswith("IFD"):
+            break
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip()
+        v = v.strip()
+        info[k] = v
+
+    # Extract average timelapse interval (ms)
+    # Example: "Average Timelapse Interval: 60000.17 ms (0.0 Hz) (+/- 0.6 ms)"
+    at = info.get("Average Timelapse Interval")
+    if isinstance(at, str):
+        m = re.search(r"([0-9]*\.?[0-9]+)\s*ms\b", at)
+        if m:
+            try:
+                info["TimeIncrement_ms"] = float(m.group(1))
+            except Exception:
+                pass
+
+    # Convenience numeric fields
+    for k in ("Z Planes", "Time Points", "Channels"):
+        if k in info and isinstance(info[k], str):
+            try:
+                info[k] = int(str(info[k]).strip())
+            except Exception:
+                pass
+    for k in ("Microns Per Pixel", "Z Step Size Microns"):
+        if k in info and isinstance(info[k], str):
+            try:
+                info[k] = float(str(info[k]).strip())
+            except Exception:
+                pass
+
+    return info
+
+
+def _pick_log_file_for_base(input_dir: Path, base: str) -> Path | None:
+    """Pick a log file for a base, if present."""
+    # Common: "<BASE>..._Z00_T00_C0.log" or "<BASE>.log" etc.
+    # We'll pick the first matching by name sort.
+    candidates = sorted(input_dir.glob(f"{base}*.log"))
+    return candidates[0] if candidates else None
+
+
+def _ensure_tzyxc(arr: np.ndarray, axes: str | None) -> np.ndarray:
+    """Convert an array with known axes into TZYXC."""
+    if axes is None:
+        # Best-effort based on ndim
+        if arr.ndim == 2:  # YX
+            arr = arr[None, None, :, :, None]
+        elif arr.ndim == 3:  # ZYX
+            arr = arr[None, :, :, :, None]
+        elif arr.ndim == 4:  # TZYX (assume)
+            arr = arr[:, :, :, :, None]
+        elif arr.ndim == 5:
+            return arr
+        else:
+            raise ValueError(f"Unsupported array ndim={arr.ndim}")
+        return arr
+
+    ax = axes.upper()
+    # Normalize common variants
+    # We want order: T Z Y X C
+    # Handle: TZYX, TCZYX, TZCYX, ZCYX, CZYX, etc.
+    wanted = "TZYXC"
+    # Build mapping from current axes to indices
+    idx = {a: i for i, a in enumerate(ax)}
+    # If no C, treat as C=1 at end
+    has_c = "C" in idx
+    has_t = "T" in idx
+    has_z = "Z" in idx
+
+    # Create view with missing dims added
+    out = arr
+    cur_axes = ax
+    if not has_t:
+        out = out[None, ...]
+        cur_axes = "T" + cur_axes
+        idx = {a: i for i, a in enumerate(cur_axes)}
+    if not has_z:
+        # if Z missing, treat as single plane
+        out = out[:, None, ...] if cur_axes[0] == "T" else out[None, ...]
+        # After insertion, easiest is to recompute with explicit insertion at correct place
+        # We'll just fall back to best-effort reorder below by padding.
+        cur_axes = cur_axes.replace("T", "TZ", 1) if cur_axes.startswith("T") else "Z" + cur_axes
+        idx = {a: i for i, a in enumerate(cur_axes)}
+    if "Y" not in idx or "X" not in idx:
+        raise ValueError(f"Cannot coerce axes {axes} to TZYXC")
+
+    if "C" not in idx:
+        # Add channel dim at end
+        out = out[..., None]
+        cur_axes = cur_axes + "C"
+        idx = {a: i for i, a in enumerate(cur_axes)}
+
+    # Now reorder to T Z Y X C
+    order = [idx["T"], idx["Z"], idx["Y"], idx["X"], idx["C"]]
+    out = np.moveaxis(out, order, range(5))
+    return out
+
+
+def _ome_plan_for_anchor(
+    anchor_path: Path,
+    *,
+    out_dir: Path,
+    out_ext: str,
+    log_files: bool,
+) -> tuple[Plan, dict]:
+    """Create a Plan using OME-XML + tifffile series metadata."""
+    with tiff.TiffFile(str(anchor_path)) as tif:
+        axes = getattr(tif.series[0], "axes", None)
+        shape = tif.series[0].shape
+        dtype = np.dtype(tif.series[0].dtype)
+
+        ome = tif.ome_metadata
+        parsed = _parse_ome_xml(ome) if ome else {"sizes": {}, "physical": {}, "time_increment_s": None, "referenced_files": []}
+        sizes = parsed["sizes"]
+        physical_um = _physical_um_from_ome(parsed["physical"])
+        time_inc_s = parsed["time_increment_s"]
+        referenced_files = parsed["referenced_files"]
+
+    # Determine T, Z, C, Y, X from shape + axes
+    # We'll coerce based on axes string if present.
+    # If axes missing, fall back to common ordering used by tifffile: TZYX or TCZYX.
+    if axes:
+        ax = axes.upper()
+        idx = {a: i for i, a in enumerate(ax)}
+        nt = shape[idx["T"]] if "T" in idx else 1
+        nz = shape[idx["Z"]] if "Z" in idx else 1
+        nc = shape[idx["C"]] if "C" in idx else 1
+        ny = shape[idx["Y"]] if "Y" in idx else shape[-2]
+        nx = shape[idx["X"]] if "X" in idx else shape[-1]
+    else:
+        # shape could be (T,Z,Y,X) or (T,C,Z,Y,X)
+        if len(shape) == 4:
+            nt, nz, ny, nx = shape
+            nc = 1
+        elif len(shape) == 5:
+            nt, nc, nz, ny, nx = shape
+        else:
+            raise ValueError(f"Unexpected series shape {shape} for {anchor_path.name}")
+
+    # OME-referenced files: check existence relative to anchor folder
+    missing_files: list[str] = []
+    if referenced_files:
+        for fn in referenced_files:
+            if not (anchor_path.parent / fn).exists():
+                missing_files.append(fn)
+
+    # Supplement metadata from log file (dt + phys sizes) if requested
+    if log_files:
+        lp = _pick_log_file_for_base(anchor_path.parent, base=_base_from_filename(anchor_path.name) or anchor_path.stem)
+        if lp is not None:
+            log_info = _parse_log_metadata_ms(lp)
+            if time_inc_s is None and "TimeIncrement_ms" in log_info:
+                time_inc_s = float(log_info["TimeIncrement_ms"]) / 1000.0
+            # Fill physical sizes if missing
+            if physical_um is None:
+                px = log_info.get("Microns Per Pixel")
+                dz = log_info.get("Z Step Size Microns")
+                if isinstance(px, (int, float)):
+                    physical_um = {"X": float(px), "Y": float(px)}
+                    if isinstance(dz, (int, float)):
+                        physical_um["Z"] = float(dz)
+
+    base = _base_from_filename(anchor_path.name) or anchor_path.stem
+    out_path = (out_dir / f"{base}.{out_ext}") if out_ext else (out_dir / f"{base}.ome.tif")
+
+    note_parts = []
+    if referenced_files:
+        note_parts.append(f"OME multi-file series ({len(referenced_files)} files referenced)")
+    else:
+        note_parts.append("OME metadata present")
+    if missing_files:
+        note_parts.append(f"MISSING referenced files: {len(missing_files)}")
+    if time_inc_s is not None:
+        note_parts.append(f"dt={time_inc_s:.6g}s")
+    if physical_um:
+        note_parts.append(
+            "px_um="
+            + ",".join(f"{k}:{v:.6g}" for k, v in physical_um.items() if k in ("X", "Y"))
+            + (f" dz_um:{physical_um['Z']:.6g}" if "Z" in physical_um else "")
+        )
+    note = " | ".join(note_parts)
+
+    # across_* are now legacy; set based on filename variability heuristics if desired.
+    # Here, since OME defines the series, treat them as False.
+    plan = Plan(
+        base=base,
+        anchor_path=anchor_path,
+        across_t=False,
+        across_z=False,
+        across_c=False,
+        nt=int(sizes.get("SizeT", nt)),
+        nz=int(sizes.get("SizeZ", nz)),
+        nc=int(sizes.get("SizeC", nc)),
+        yx=(int(sizes.get("SizeY", ny)), int(sizes.get("SizeX", nx))),
+        dtype=dtype,
+        n_files=len(referenced_files) if referenced_files else 1,
+        missing_keys=[],
+        missing_files=missing_files,
+        axes=axes,
+        referenced_files=referenced_files,
+        physical_sizes_um=physical_um,
+        time_increment_s=time_inc_s,
+        out_path=out_path,
+        note=note,
     )
+
+    internal = {
+        "axes": axes,
+        "shape": shape,
+    }
+    return plan, internal
+
+
+def _base_from_filename(name: str) -> str | None:
+    m = TIFF_RE.match(name)
+    return m.group("base") if m else None
 
 
 def assemble_marianas_stack(
@@ -438,52 +849,66 @@ def assemble_marianas_stack(
     out_dir: Path | str | None = None,
     recursive: bool = False,
     save: bool = True,
+    verbose: bool = True,
+    # OME-first behavior
+    use_ome: bool = True,
+    # Metadata supplement
+    log_files: bool = True,
+    # Missing-data behavior (applies to OME-referenced files too)
     allow_missing_files: bool = False,
-    fill_value: int | None = None,
-    # Override FINAL assembled dims
+    fill_value: int | None = None,  # legacy; OME mode uses tifffile's zero-fill
+    # Legacy override knobs (kept for backward-compatibility; ignored in OME mode)
     nt: int | None = None,
     nz: int | None = None,
     nc: int | None = None,
-    # Override INTERNAL per-file dims interpretation
     file_nt: int | None = None,
     file_nz: int | None = None,
     file_nc: int | None = None,
     out_ext: str = "ome.tif",
-    # Optional selection
     bases: list[str] | None = None,
     return_data: bool = False,
-    verbose: bool = True,
 ) -> dict:
-    """
-    Function for assembling microscope TIFF exports into OME-TIFF stacks.
+    """Batch assemble Marianas/SlideBook TIFF exports into one OME-TIFF per base.
+
+    This function is now **OME-first**:
+
+    - If a dataset is an OME multi-file series, we rely on the OME-XML to determine
+      the full stack shape and to stitch the referenced files.
+    - If OME metadata is missing, we fall back to the legacy filename/grid heuristics.
+
+    Log files are optional and used only as a *metadata supplement* (e.g. fill missing dt,
+    and correct/confirm physical pixel sizes). They do not affect stacking logic in OME mode.
 
     Parameters
     ----------
     input_dir:
-        Folder containing TIFFs named like <BASE>_Z00_T01_C0.tif
+        Folder containing exported TIFFs (and optionally .log files).
     out_dir:
         Output folder (default: input_dir / "Stacks")
     recursive:
-        If True, search input_dir recursively.
+        If True, search input_dir recursively for TIFFs.
     save:
         If True, write OME-TIFF(s). If False, dry-run planning only.
+    verbose:
+        Print plan summaries.
+    use_ome:
+        If True (default), prefer OME-XML + tifffile series stitching when OME metadata is present.
+    log_files:
+        If True (default), use Marianas .log files to supplement missing metadata (dt, physical sizes).
     allow_missing_files:
-        If True, fill missing file-slots instead of raising.
+        If False (default), raise if OME-XML references files that are missing.
+        If True, proceed; tifffile will zero-fill missing planes and emit warnings.
     fill_value:
-        Fill value for missing slots (default 0 if allow_missing_files=True).
-    nt/nz/nc:
-        Override FINAL assembled output dims.
-    file_nt/file_nz/file_nc:
-        Override INTERNAL per-file interpretation (disambiguates multi-page TIFF axes).
+        Legacy: fill value for missing slots when using filename/grid assembly.
+        (OME mode uses tifffile's behavior; fill_value is ignored there.)
+    nt/nz/nc, file_nt/file_nz/file_nc:
+        Legacy overrides for filename/grid assembly; ignored in OME mode.
     out_ext:
         Output extension, e.g. "ome.tif".
     bases:
-        If provided, only assemble groups whose base name is in this list.
+        Optional list of base names to assemble.
     return_data:
-        If True and save=True, also return the assembled numpy array(s) in-memory.
-        (Beware: can be huge.)
-    verbose:
-        Print plan summaries like the CLI.
+        If True and save=True, also return assembled numpy array(s) in-memory (can be huge).
 
     Returns
     -------
@@ -493,6 +918,7 @@ def assemble_marianas_stack(
         - "written": list[Path] (if save=True)
         - "data": dict[str, np.ndarray] (if return_data=True and save=True)
         - "notes": list[str]
+        - "summary": str
     """
     inp = Path(input_dir)
     if not inp.exists():
@@ -506,8 +932,9 @@ def assemble_marianas_stack(
         groups = {b: g for b, g in groups.items() if b in bases_set}
 
     if not groups:
+        msg = f"No matching TIFFs found in {inp}"
         if verbose:
-            print(f"No matching TIFFs found in {inp}")
+            print(msg)
         return {
             "input_dir": inp,
             "out_dir": outp,
@@ -516,6 +943,7 @@ def assemble_marianas_stack(
             "written": [],
             "data": {} if return_data else None,
             "notes": [],
+            "summary": msg,
         }
 
     written: list[Path] = []
@@ -527,64 +955,119 @@ def assemble_marianas_stack(
         mode = "SAVE" if save else "DRY-RUN"
         print(f"Found {len(groups)} group(s). Mode: {mode}")
         print(f"Output dir: {outp}")
-        if any(v is not None for v in (nt, nz, nc)):
-            print(f"Final overrides: nt={nt} nz={nz} nc={nc}")
-        if any(v is not None for v in (file_nt, file_nz, file_nc)):
-            print(f"Internal overrides: file_nt={file_nt} file_nz={file_nz} file_nc={file_nc}")
+        print(f"OME-first: use_ome={use_ome} (log_files={log_files})")
+        if not use_ome:
+            if any(v is not None for v in (nt, nz, nc)):
+                print(f"Final overrides: nt={nt} nz={nz} nc={nc}")
+            if any(v is not None for v in (file_nt, file_nz, file_nc)):
+                print(f"Internal overrides: file_nt={file_nt} file_nz={file_nz} file_nc={file_nc}")
         print("")
 
     for i, (base, g) in enumerate(sorted(groups.items(), key=lambda kv: kv[0].lower()), start=1):
-        plan, internal = plan_group(
-            g=g,
-            out_dir=outp,
-            nz_override=nz,
-            nt_override=nt,
-            nc_override=nc,
-            file_nz=file_nz,
-            file_nt=file_nt,
-            file_nc=file_nc,
-            out_ext=out_ext,
-        )
+        # Pick an anchor file for this base (prefer lowest T, then Z, then C).
+        anchor_key = sorted(g.frames.keys(), key=lambda k: (k.t, k.z, k.c))[0]
+        anchor_path = g.frames[anchor_key]
+
+        # Determine whether this group has OME metadata
+        ome_available = False
+        if use_ome:
+            try:
+                with tiff.TiffFile(str(anchor_path)) as tif:
+                    ome_available = tif.ome_metadata is not None
+            except Exception:
+                ome_available = False
+
+        if ome_available and use_ome:
+            plan, internal = _ome_plan_for_anchor(
+                anchor_path=anchor_path,
+                out_dir=outp,
+                out_ext=out_ext,
+                log_files=log_files,
+            )
+        else:
+            # Legacy fallback
+            plan, internal = plan_group(
+                g=g,
+                out_dir=outp,
+                nz_override=nz,
+                nt_override=nt,
+                nc_override=nc,
+                file_nz=file_nz,
+                file_nt=file_nt,
+                file_nc=file_nc,
+                out_ext=out_ext,
+            )
+
         plans.append(plan)
         notes.append(plan.note)
 
         if verbose:
             print(f"[{i}/{len(groups)}] {plan.base}")
-            print(
-                f"  Files: {plan.n_files}  (T vals={g.t_vals[:5]}{'...' if len(g.t_vals)>5 else ''}, "
-                f"Z vals={g.z_vals[:5]}{'...' if len(g.z_vals)>5 else ''}, "
-                f"C vals={g.c_vals})"
-            )
+            print(f"  Anchor: {anchor_path.name}")
+            if getattr(plan, "axes", None):
+                print(f"  Series axes/shape: {plan.axes} / ({plan.nt},{plan.nz},{plan.yx[0]},{plan.yx[1]},{plan.nc})")
             print(f"  {plan.note}")
-            print(
-                f"  Output dims: (T,Z,Y,X,C)=({plan.nt},{plan.nz},{plan.yx[0]},{plan.yx[1]},{plan.nc}) "
-                f"dtype={plan.dtype}"
-            )
             print(f"  Output: {plan.out_path}")
 
+            if getattr(plan, "missing_files", None):
+                mf = plan.missing_files
+                if mf:
+                    print(f"  Missing referenced files: {len(mf)}")
+                    for fn in mf[:10]:
+                        print(f"    missing {fn}")
+                    if len(mf) > 10:
+                        print(f"    ... (+{len(mf)-10} more)")
+                    if not allow_missing_files:
+                        print("  NOTE: will ERROR on missing unless allow_missing_files=True")
+
             if plan.missing_keys:
-                print(f"  Missing file-slots: {len(plan.missing_keys)}")
-                for k in plan.missing_keys[:10]:
-                    print(f"    missing {k}")
-                if len(plan.missing_keys) > 10:
-                    print(f"    ... (+{len(plan.missing_keys)-10} more)")
+                print(f"  Missing file-slots (legacy grid): {len(plan.missing_keys)}")
                 if not allow_missing_files:
                     print("  NOTE: will ERROR on missing unless allow_missing_files=True")
 
         if save:
-            arr = assemble_group(
-                g=g,
-                plan=plan,
-                internal=internal,
-                allow_missing_files=allow_missing_files,
-                fill_value=fill_value,
-            )
-            write_ome_tiff(plan.out_path, arr)
-            written.append(plan.out_path)
-            if return_data:
-                data_out[plan.base] = arr
-            if verbose:
-                print("  Wrote OME-TIFF.")
+            # OME-first save path
+            if ome_available and use_ome:
+                if getattr(plan, "missing_files", None) and plan.missing_files and not allow_missing_files:
+                    # Fail early with a clear error
+                    sample = "\n".join(f"  - {fn}" for fn in plan.missing_files[:25])
+                    more = "" if len(plan.missing_files) <= 25 else f"\n  ... (+{len(plan.missing_files)-25} more)"
+                    raise FileNotFoundError(
+                        f"OME series for base '{plan.base}' references missing file(s):\n{sample}{more}"
+                    )
+
+                # Read the full OME series (may emit warnings + zero-fill if allow_missing_files=True)
+                with tiff.TiffFile(str(anchor_path)) as tif:
+                    axes = getattr(tif.series[0], "axes", None)
+                arr = tiff.imread(str(anchor_path))
+                arr_tzyxc = _ensure_tzyxc(arr, axes)
+
+                write_ome_tiff(
+                    plan.out_path,
+                    arr_tzyxc,
+                    physical_sizes_um=getattr(plan, "physical_sizes_um", None),
+                    time_increment_s=getattr(plan, "time_increment_s", None),
+                )
+                written.append(plan.out_path)
+                if return_data:
+                    data_out[plan.base] = arr_tzyxc
+                if verbose:
+                    print("  Wrote OME-TIFF.")
+            else:
+                # Legacy save path
+                arr = assemble_group(
+                    g=g,
+                    plan=plan,
+                    internal=internal,
+                    allow_missing_files=allow_missing_files,
+                    fill_value=fill_value,
+                )
+                write_ome_tiff(plan.out_path, arr)
+                written.append(plan.out_path)
+                if return_data:
+                    data_out[plan.base] = arr
+                if verbose:
+                    print("  Wrote OME-TIFF (legacy).")
         else:
             if verbose:
                 print("  Dry-run only (set save=True to write).")
@@ -592,6 +1075,7 @@ def assemble_marianas_stack(
         if verbose:
             print("")
 
+    summary = f"Assembled {len(plans)} plan(s). Wrote {len(written)} file(s)." if save else f"Planned {len(plans)} stack(s) (dry-run)."
     return {
         "input_dir": inp,
         "out_dir": outp,
@@ -600,97 +1084,8 @@ def assemble_marianas_stack(
         "written": written,
         "data": data_out if return_data else None,
         "notes": notes,
+        "summary": summary,
     }
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("input_dir", type=Path)
-    ap.add_argument("--out-dir", type=Path, default=None)
-    ap.add_argument("--recursive", action="store_true")
-    ap.add_argument("--save", action="store_true", help="Write OME-TIFFs (default dry-run)")
-    ap.add_argument("--allow-missing-files", action="store_true", help="Fill missing file-slots instead of erroring")
-    ap.add_argument("--fill", type=int, default=None, help="Fill value for missing slots (default 0)")
-
-    # Override FINAL assembled dims
-    ap.add_argument("--nt", type=int, default=None)
-    ap.add_argument("--nz", type=int, default=None)
-    ap.add_argument("--nc", type=int, default=None)
-
-    # Override INTERNAL per-file dims interpretation
-    ap.add_argument("--file-nt", type=int, default=None, help="Force internal T inside each TIFF")
-    ap.add_argument("--file-nz", type=int, default=None, help="Force internal Z inside each TIFF")
-    ap.add_argument("--file-nc", type=int, default=None, help="Force internal C inside each TIFF")
-
-    ap.add_argument("--ext", type=str, default="ome.tif")
-    args = ap.parse_args()
-
-    inp = args.input_dir
-    if not inp.exists():
-        raise SystemExit(f"Not found: {inp}")
-
-    out_dir = args.out_dir if args.out_dir is not None else (inp / "Stacks")
-    groups = collect_groups(inp, recursive=args.recursive)
-
-    if not groups:
-        print(f"No matching TIFFs found in {inp}")
-        return 0
-
-    print(f"Found {len(groups)} group(s). Mode: {'SAVE' if args.save else 'DRY-RUN'}")
-    print(f"Output dir: {out_dir}")
-    if any(v is not None for v in (args.nt, args.nz, args.nc)):
-        print(f"Final overrides: nt={args.nt} nz={args.nz} nc={args.nc}")
-    if any(v is not None for v in (args.file_nt, args.file_nz, args.file_nc)):
-        print(f"Internal overrides: file_nt={args.file_nt} file_nz={args.file_nz} file_nc={args.file_nc}")
-    print("")
-
-    for i, (base, g) in enumerate(sorted(groups.items(), key=lambda kv: kv[0].lower()), start=1):
-        plan, internal = plan_group(
-            g=g,
-            out_dir=out_dir,
-            nz_override=args.nz,
-            nt_override=args.nt,
-            nc_override=args.nc,
-            file_nz=args.file_nz,
-            file_nt=args.file_nt,
-            file_nc=args.file_nc,
-            out_ext=args.ext,
-        )
-
-        print(f"[{i}/{len(groups)}] {plan.base}")
-        print(f"  Files: {plan.n_files}  (T vals={g.t_vals[:5]}{'...' if len(g.t_vals)>5 else ''}, "
-              f"Z vals={g.z_vals[:5]}{'...' if len(g.z_vals)>5 else ''}, "
-              f"C vals={g.c_vals})")
-        print(f"  {plan.note}")
-        print(f"  Output dims: (T,Z,Y,X,C)=({plan.nt},{plan.nz},{plan.yx[0]},{plan.yx[1]},{plan.nc}) dtype={plan.dtype}")
-        print(f"  Output: {plan.out_path}")
-
-        if plan.missing_keys:
-            print(f"  Missing file-slots: {len(plan.missing_keys)}")
-            for k in plan.missing_keys[:10]:
-                print(f"    missing {k}")
-            if len(plan.missing_keys) > 10:
-                print(f"    ... (+{len(plan.missing_keys)-10} more)")
-            if not args.allow_missing_files:
-                print("  NOTE: will ERROR on missing unless --allow-missing-files is set")
-
-        if args.save:
-            data = assemble_group(
-                g=g,
-                plan=plan,
-                internal=internal,
-                allow_missing_files=args.allow_missing_files,
-                fill_value=args.fill,
-            )
-            write_ome_tiff(plan.out_path, data)
-            print("  Wrote OME-TIFF.")
-
-        else:
-            print("  Dry-run only (use --save to write).")
-
-        print("")
-
-    return 0
 
 
 if __name__ == "__main__":
